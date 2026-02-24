@@ -1,0 +1,30 @@
+{
+  "version": "20260222_203045_d676c136",
+  "timestamp": "20260222_203045",
+  "source": "laptop_csv",
+  "rows": 6693,
+  "columns": [
+    "name",
+    "brand",
+    "os",
+    "cpu_cores",
+    "cpu_threads",
+    "gpu_vram",
+    "ram_capacity",
+    "ram_ddr_type",
+    "hdd",
+    "ssd",
+    "screen_size",
+    "screen_res",
+    "touchscreen",
+    "user_rating",
+    "price",
+    "cpu",
+    "gpu",
+    "laptop_id",
+    "gpu_type",
+    "cpu_tier",
+    "usage_type"
+  ],
+  "hash": "d676c136"
+}
