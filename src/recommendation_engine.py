@@ -1,232 +1,265 @@
+import pickle
+from typing import Dict, List, Optional, Tuple
+
 import numpy as np
 import pandas as pd
-from typing import List, Dict, Optional, Tuple
+
 from src.text_encoder import LaptopTextEncoder
 from src.knn_index import LaptopKNNIndex
 
+
 class LaptopRecommendationEngine:
+    """
+    High-level engine used both during training and in the Django API.
+
+    Training workflow
+    -----------------
+    engine = LaptopRecommendationEngine()
+    engine.fit(df)
+    engine.save("models/laptop_recommender_v1")
+
+    Serving workflow
+    ----------------
+    engine = LaptopRecommendationEngine()
+    engine.load("models/laptop_recommender_v1")
+    results = engine.search_by_text("gaming laptop with RTX")
+    """
+
     def __init__(self):
-        self.encoder = None
-        self.index = None
-        self.df = None
-        
-    def fit(self, df: pd.DataFrame, encoder_model: str = 'all-MiniLM-L6-v2'):
-        """Build the recommendation engine"""
-        self.df = df.copy()
-        
-        # Initialize encoder
-        self.encoder = LaptopTextEncoder(encoder_model)
-        
-        # Create embeddings
+        self.encoder:      Optional[LaptopTextEncoder] = None
+        self.index:        Optional[LaptopKNNIndex]    = None
+        self.df:           Optional[pd.DataFrame]      = None
+        self._encoder_model: str = "all-MiniLM-L6-v2"
+
+    # ------------------------------------------------------------------
+    # Training
+    # ------------------------------------------------------------------
+
+    def fit(
+        self,
+        df:            pd.DataFrame,
+        encoder_model: str = "all-MiniLM-L6-v2",
+    ) -> "LaptopRecommendationEngine":
+        """Encode all laptops and build the FAISS KNN index."""
+        self.df             = df.copy()
+        self._encoder_model = encoder_model
+        self.encoder        = LaptopTextEncoder(encoder_model)
+
+        # Encode → already L2-normalised inside encode_laptops()
         embeddings = self.encoder.encode_laptops(df)
-        
-        # Build metadata lookup
-        metadata = {}
-        for _, row in df.iterrows():
-            metadata[int(row['laptop_id'])] = {
-                'name': row['name'],
-                'brand': row['brand'],
-                'price': float(row['price']),
-                'cpu': row['cpu'],
-                'gpu': row['gpu'],
-                'ram': int(row['ram_capacity']),
-                'ssd': int(row['ssd']),
-                'rating': float(row['user_rating']),
-                'usage_type': row.get('usage_type', 'unknown'),
-                'screen_size': row['screen_size']
+
+        # Build metadata lookup  {laptop_id → dict}
+        metadata = {
+            int(row["laptop_id"]): {
+                "name":       row["name"],
+                "brand":      row["brand"],
+                "price":      float(row["price"]),
+                "cpu":        row["cpu"],
+                "gpu":        row["gpu"],
+                "ram":        int(row["ram_capacity"]),
+                "ssd":        int(row["ssd"]),
+                "rating":     float(row["user_rating"]),
+                "usage_type": row.get("usage_type", "unknown"),
+                "screen_size":row.get("screen_size", 15),
             }
-        
+            for _, row in df.iterrows()
+        }
+
         # Build KNN index
         self.index = LaptopKNNIndex(embedding_dim=self.encoder.embedding_dim)
-        self.index.build_index(
-            embeddings, 
-            df['laptop_id'].tolist(),
-            metadata
-        )
-        
+        self.index.build_index(embeddings, df["laptop_id"].tolist(), metadata)
+
         return self
-    
+
+    # ------------------------------------------------------------------
+    # Recommendation methods
+    # ------------------------------------------------------------------
+
     def get_similar_laptops(
-        self, 
-        laptop_id: int, 
-        n: int = 5,
-        price_range: Optional[Tuple[float, float]] = None
+        self,
+        laptop_id:   int,
+        n:           int = 5,
+        price_range: Optional[Tuple[float, float]] = None,
     ) -> List[Dict]:
-        """Find laptops similar to given laptop ID"""
+        """Return laptops most similar to *laptop_id*."""
+        self._check_fitted()
         if laptop_id not in self.index.metadata:
             return []
-        
-        # Get laptop embedding
-        laptop_meta = self.index.metadata[laptop_id]
-        query_text = f"{laptop_meta['name']}. {laptop_meta['cpu']}. {laptop_meta['gpu']}"
-        query_embedding = self.encoder.encode_query(query_text)
-        
-        # Search
-        results = self.index.search(
-            query_embedding, 
-            k=n,
-            price_range=price_range
-        )
-        
-        return self._format_results(results, exclude_id=laptop_id)
-    
+
+        meta  = self.index.metadata[laptop_id]
+        text  = f"{meta['name']}. {meta['cpu']}. {meta['gpu']}"
+        q_emb = self.encoder.encode_query(text)
+
+        results = self.index.search(q_emb, k=n + 1, price_range=price_range)
+        return self._format(results, exclude_id=laptop_id)[:n]
+
     def search_by_text(
-        self, 
-        query: str, 
-        n: int = 5,
-        price_range: Optional[Tuple[float, float]] = None,
-        usage_filter: Optional[str] = None
+        self,
+        query:        str,
+        n:            int = 5,
+        price_range:  Optional[Tuple[float, float]] = None,
+        usage_filter: Optional[str] = None,
     ) -> List[Dict]:
-        """Search laptops by natural language query"""
-        query_embedding = self.encoder.encode_query(query)
-        
+        """Search laptops using a natural-language query string."""
+        self._check_fitted()
+        q_emb   = self.encoder.encode_query(query)
         results = self.index.search(
-            query_embedding,
-            k=n,
+            q_emb, k=n,
             price_range=price_range,
-            usage_filter=usage_filter
+            usage_filter=usage_filter,
         )
-        
-        return self._format_results(results)
-    
+        return self._format(results)
+
     def get_recommendations_by_preferences(
         self,
-        usage_type: Optional[str] = None,
-        max_price: Optional[float] = None,
-        min_price: Optional[float] = None,
-        preferred_brand: Optional[str] = None,
-        min_ram: Optional[int] = None,
-        n: int = 5
+        usage_type:      Optional[str]   = None,
+        max_price:       Optional[float] = None,
+        min_price:       Optional[float] = None,
+        preferred_brand: Optional[str]   = None,
+        min_ram:         Optional[int]   = None,
+        n:               int = 5,
     ) -> List[Dict]:
-        """Get recommendations based on preferences"""
-        # Build preference query
-        query_parts = ["laptop"]
-        
-        if usage_type:
-            query_parts.append(f"for {usage_type}")
-        if preferred_brand:
-            query_parts.append(f"by {preferred_brand}")
-        if min_ram:
-            query_parts.append(f"with {min_ram}GB RAM")
-            
-        query = " ".join(query_parts)
-        query_embedding = self.encoder.encode_query(query)
-        
-        # Set price range
+        """Structured preference-based recommendations."""
+        self._check_fitted()
+        parts = ["laptop"]
+        if usage_type:      parts.append(f"for {usage_type}")
+        if preferred_brand: parts.append(f"by {preferred_brand}")
+        if min_ram:         parts.append(f"with {min_ram}GB RAM")
+
+        q_emb       = self.encoder.encode_query(" ".join(parts))
         price_range = None
-        if min_price or max_price:
-            price_range = (min_price or 0, max_price or float('inf'))
-        
-        # Search with usage filter
+        if min_price is not None or max_price is not None:
+            price_range = (min_price or 0, max_price or float("inf"))
+
         results = self.index.search(
-            query_embedding,
-            k=n,
+            q_emb, k=n,
             price_range=price_range,
-            usage_filter=usage_type
+            usage_filter=usage_type,
         )
-        
-        return self._format_results(results)
-    
+        return self._format(results)
+
     def get_personalized_recommendations(
         self,
         user_history: List[int],
-        n: int = 5
+        n:            int = 5,
     ) -> List[Dict]:
-        """Get recommendations based on user's viewing history"""
+        """Blend embeddings of previously viewed laptops (recency-weighted)."""
+        self._check_fitted()
         if not user_history:
-            # Return popular items
-            return self._get_popular_recommendations(n)
-        
-        # Average embeddings of viewed laptops
-        embeddings = []
+            return self._popular(n)
+
+        embs = []
         for lid in user_history:
             if lid in self.index.metadata:
                 meta = self.index.metadata[lid]
                 text = f"{meta['name']}. {meta['cpu']}. {meta['gpu']}"
-                emb = self.encoder.encode_query(text)
-                embeddings.append(emb)
-        
-        if not embeddings:
-            return self._get_popular_recommendations(n)
-        
-        # Weighted average (more recent = higher weight)
-        weights = np.exp(np.linspace(-1, 0, len(embeddings)))
+                embs.append(self.encoder.encode_query(text))
+
+        if not embs:
+            return self._popular(n)
+
+        # Exponential recency weighting
+        weights = np.exp(np.linspace(-1, 0, len(embs)))
         weights /= weights.sum()
-        
-        query_embedding = np.average(embeddings, axis=0, weights=weights)
-        
-        # Exclude already seen
-        results = self.index.search(query_embedding, k=n * 2)
-        filtered = [r for r in results if r['laptop_id'] not in user_history]
-        
-        return self._format_results(filtered[:n])
-    
-    def _format_results(
-        self, 
-        results: List[dict], 
-        exclude_id: Optional[int] = None
-    ) -> List[Dict]:
-        """Format results for API response"""
-        formatted = []
-        for r in results:
-            if exclude_id and r['laptop_id'] == exclude_id:
-                continue
-                
-            meta = r['metadata']
-            formatted.append({
-                'laptop_id': r['laptop_id'],
-                'name': meta['name'],
-                'brand': meta['brand'],
-                'price': meta['price'],
-                'cpu': meta['cpu'],
-                'gpu': meta['gpu'],
-                'ram_capacity': meta['ram'],
-                'ssd': meta['ssd'],
-                'user_rating': meta['rating'],
-                'usage_type': meta['usage_type'],
-                'similarity_score': round(r['similarity_score'], 4)
-            })
-        return formatted
-    
-    def _get_popular_recommendations(self, n: int) -> List[Dict]:
-        """Fallback: return highest rated laptops"""
-        top_laptops = self.df.nlargest(n, 'user_rating')
-        results = []
-        for _, row in top_laptops.iterrows():
-            results.append({
-                'laptop_id': int(row['laptop_id']),
-                'name': row['name'],
-                'brand': row['brand'],
-                'price': float(row['price']),
-                'cpu': row['cpu'],
-                'gpu': row['gpu'],
-                'ram_capacity': int(row['ram_capacity']),
-                'ssd': int(row['ssd']),
-                'user_rating': float(row['user_rating']),
-                'usage_type': row.get('usage_type', 'unknown'),
-                'similarity_score': 1.0
-            })
-        return results
-    
-    def save(self, path_prefix: str):
-        """Save model components"""
+        q_emb = np.average(embs, axis=0, weights=weights).astype("float32")
+
+        results  = self.index.search(q_emb, k=n * 2)
+        filtered = [r for r in results if r["laptop_id"] not in user_history]
+        return self._format(filtered[:n])
+
+    # ------------------------------------------------------------------
+    # Persistence
+    # ------------------------------------------------------------------
+
+    def save(self, path_prefix: str) -> None:
+        """
+        Persist model to disk.
+        Writes:
+          {path_prefix}_index.faiss
+          {path_prefix}_index.meta
+          {path_prefix}_config.pkl
+        """
         self.index.save(f"{path_prefix}_index")
-        # Save encoder config and df
-        import pickle
-        with open(f"{path_prefix}_config.pkl", 'wb') as f:
-            pickle.dump({
-                'df': self.df,
-                'encoder_model': 'all-MiniLM-L6-v2'
-            }, f)
-    
-    def load(self, path_prefix: str):
-        """Load model components"""
-        import pickle
+        config = {
+            "encoder_model": self._encoder_model,
+            "df":            self.df,
+        }
+        with open(f"{path_prefix}_config.pkl", "wb") as f:
+            pickle.dump(config, f)
+        print(f"[engine] Model saved → {path_prefix}_*")
+
+    def load(self, path_prefix: str) -> "LaptopRecommendationEngine":
+        """
+        Load a previously saved model from disk.
+        Restores encoder, KNN index, and DataFrame.
+
+        FIX: embedding_dim is now correctly read from the saved .meta file
+        (via the knn_index.load() fix) instead of defaulting to 384.
+        """
+        # Load KNN index (embedding_dim restored inside load())
         self.index = LaptopKNNIndex()
         self.index.load(f"{path_prefix}_index")
-        
-        with open(f"{path_prefix}_config.pkl", 'rb') as f:
+
+        # Load config
+        with open(f"{path_prefix}_config.pkl", "rb") as f:
             config = pickle.load(f)
-            self.df = config['df']
-            
-        self.encoder = LaptopTextEncoder(config['encoder_model'])
+
+        self.df             = config["df"]
+        self._encoder_model = config["encoder_model"]
+        self.encoder        = LaptopTextEncoder(self._encoder_model)
+
+        print(f"[engine] Model loaded ← {path_prefix}_*")
+        return self
+
+    # ------------------------------------------------------------------
+    # Helpers
+    # ------------------------------------------------------------------
+
+    def _format(
+        self,
+        results:    List[dict],
+        exclude_id: Optional[int] = None,
+    ) -> List[Dict]:
+        out = []
+        for r in results:
+            if exclude_id is not None and r["laptop_id"] == exclude_id:
+                continue
+            m = r["metadata"]
+            out.append({
+                "laptop_id":        r["laptop_id"],
+                "name":             m["name"],
+                "brand":            m["brand"],
+                "price":            m["price"],
+                "cpu":              m["cpu"],
+                "gpu":              m["gpu"],
+                "ram_capacity":     m["ram"],
+                "ssd":              m["ssd"],
+                "user_rating":      m["rating"],
+                "usage_type":       m["usage_type"],
+                "similarity_score": round(r["similarity_score"], 4),
+            })
+        return out
+
+    def _popular(self, n: int) -> List[Dict]:
+        """Fallback — return highest-rated laptops when no history available."""
+        top = self.df.nlargest(n, "user_rating")
+        return [
+            {
+                "laptop_id":        int(row["laptop_id"]),
+                "name":             row["name"],
+                "brand":            row["brand"],
+                "price":            float(row["price"]),
+                "cpu":              row["cpu"],
+                "gpu":              row["gpu"],
+                "ram_capacity":     int(row["ram_capacity"]),
+                "ssd":              int(row["ssd"]),
+                "user_rating":      float(row["user_rating"]),
+                "usage_type":       row.get("usage_type", "unknown"),
+                "similarity_score": 1.0,
+            }
+            for _, row in top.iterrows()
+        ]
+
+    def _check_fitted(self) -> None:
+        if self.index is None or self.encoder is None:
+            raise RuntimeError("Engine not fitted. Call fit() or load() first.")

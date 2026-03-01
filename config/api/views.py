@@ -1,267 +1,408 @@
-import os
+"""
+api/views.py
+------------
+Django API views for the Laptop Recommendation System.
+
+Project layout
+--------------
+rec_system/
+  api/views.py          ← this file
+  config/settings.py    ← BASE_DIR = rec_system/
+  models/               ← trained model artifacts (production_version.json etc.)
+  src/                  ← ML source code
+
+Model loading
+-------------
+Reads rec_system/models/production_version.json which is written
+automatically by pipelines/training_pipeline.py after training.
+No manual configuration needed — just run `python main.py` to train,
+then `python manage.py runserver` to serve.
+
+Endpoints
+---------
+POST /api/recommend/            — text search, item-to-item, or preferences
+GET  /api/health/               — model status + version
+GET  /api/laptop/<id>/          — single laptop detail
+POST /api/admin/reload/         — hot-reload model after retraining
+"""
+
 import json
+import os
 import sys
+import threading
 import time
+from pathlib import Path
+
+from django.conf import settings
 from django.http import JsonResponse
+from django.utils.decorators import method_decorator
 from django.views import View
 from django.views.decorators.csrf import csrf_exempt
-from django.utils.decorators import method_decorator
-from django.conf import settings
 
-# Add project root to path for src imports
-# PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-# sys.path.insert(0, PROJECT_ROOT)
-PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-if PROJECT_ROOT not in sys.path:
-    sys.path.insert(0, PROJECT_ROOT)
-    
-    
-# BASE_DIR = Path(__file__).resolve().parent.parent
-# PROJECT_ROOT = BASE_DIR.parent  # Go up one more level to rec_system
+# ---------------------------------------------------------------------------
+# Make sure rec_system/ (project root) is on sys.path so `src.*` imports work.
+# BASE_DIR in settings.py is rec_system/ (where manage.py lives).
+# ---------------------------------------------------------------------------
+_PROJECT_ROOT = str(Path(settings.BASE_DIR).parent)
+if _PROJECT_ROOT not in sys.path:
+    sys.path.insert(0, _PROJECT_ROOT)
 
-# # Add src to Python path
-# sys.path.insert(0, str(PROJECT_ROOT))
-
-from src.recommendation_engine import LaptopRecommendationEngine
+from src.recommendation_engine import LaptopRecommendationEngine   # noqa: E402
 
 
 # =============================================================================
-# SINGLETON MODEL INSTANCE
+# MODEL MANAGER  — thread-safe singleton
 # =============================================================================
 
 class ModelManager:
     """
-    Manages the recommendation model singleton
-    Loads from api/ml_models/ directory
+    Thread-safe singleton that loads the trained model once and keeps it
+    in memory.  Supports hot-reload via a trigger file.
+
+    Model location
+    --------------
+    The training pipeline writes:
+        rec_system/models/production_version.json
+            {
+                "version":    "20260301_161819_2e2a7e22",
+                "model_path": "models/laptop_recommender_20260301_161819_2e2a7e22",
+                ...
+            }
+
+    model_path is relative to PROJECT_ROOT (rec_system/).
     """
-    _instance = None
-    _version = None
-    _last_check = 0
-    
+
+    _engine:  LaptopRecommendationEngine | None = None
+    _version: str | None = None
+    _lock:    threading.Lock = threading.Lock()
+
+    # Paths — all relative to rec_system/ (settings.BASE_DIR)
+    _PRODUCTION_JSON  = "models/production_version.json"
+    _RELOAD_TRIGGER   = "models/.reload_trigger"
+
+    # ------------------------------------------------------------------
+    # Public API
+    # ------------------------------------------------------------------
+
     @classmethod
-    def get_engine(cls):
-        """Get or reload model if trigger exists"""
-        model_dir = os.path.join(settings.BASE_DIR, 'api', 'ml_models')
-        
-        # Check for reload trigger (created by deployment pipeline)
-        trigger_file = os.path.join(model_dir, '.reload_trigger')
-        if os.path.exists(trigger_file):
-            print("🔄 Reload trigger detected, reloading model...")
-            cls._instance = None
-            os.remove(trigger_file)
-        
-        # Load if not exists
-        if cls._instance is None:
-            cls._load_model(model_dir)
-        
-        return cls._instance
-    
+    def get_engine(cls) -> LaptopRecommendationEngine | None:
+        """Return the active engine, loading or reloading as needed."""
+        trigger = os.path.join(_PROJECT_ROOT, cls._RELOAD_TRIGGER)
+
+        if os.path.exists(trigger):
+            print("[ModelManager] 🔄 Reload trigger detected — reloading …")
+            with cls._lock:
+                cls._engine = None
+            try:
+                os.remove(trigger)
+            except OSError:
+                pass
+
+        if cls._engine is None:
+            with cls._lock:
+                if cls._engine is None:      # double-checked locking
+                    cls._load()
+
+        return cls._engine
+
     @classmethod
-    def _load_model(cls, model_dir):
-        """Load model from Django's ml_models directory"""
-        version_file = os.path.join(model_dir, 'version.json')
-        
-        if not os.path.exists(version_file):
-            print("⚠️ No version.json found")
-            return None
-        
-        # Read version info
-        with open(version_file) as f:
-            version_info = json.load(f)
-        
-        model_path = version_info.get('model_path', os.path.join(model_dir, 'recommender_latest'))
-        
-        # Check if model files exist
-        if not os.path.exists(f"{model_path}_index.faiss"):
-            print(f"❌ Model files not found at: {model_path}")
-            return None
-        
-        # Load engine
-        print(f"📦 Loading model: {version_info.get('version', 'unknown')}")
-        cls._instance = LaptopRecommendationEngine()
-        cls._instance.load(model_path)
-        cls._version = version_info.get('version')
-        
-        print(f"✅ Model loaded: {cls._version} ({len(cls._instance.df)} laptops)")
-        return cls._instance
-    
+    def force_reload(cls) -> LaptopRecommendationEngine | None:
+        """Force an immediate reload from disk."""
+        with cls._lock:
+            cls._engine = None
+        return cls.get_engine()
+
     @classmethod
-    def get_version(cls):
+    def get_version(cls) -> str | None:
         return cls._version
 
+    # ------------------------------------------------------------------
+    # Internal loader
+    # ------------------------------------------------------------------
+
+    @classmethod
+    def _load(cls) -> None:
+        """
+        Read production_version.json and load the model artifacts.
+        model_path in the JSON is relative to PROJECT_ROOT.
+        """
+        version_file = os.path.join(_PROJECT_ROOT, cls._PRODUCTION_JSON)
+        print("DEBUG _PROJECT_ROOT:", _PROJECT_ROOT)
+        
+        print("DEBUG version_file:", version_file)
+        print("DEBUG exists?:", os.path.exists(version_file))
+
+        if not os.path.exists(version_file):
+            print(f"[ModelManager] ⚠  {cls._PRODUCTION_JSON} not found.")
+            print("[ModelManager]    Run `python main.py` to train first.")
+            return
+
+        with open(version_file) as f:
+            info = json.load(f)
+
+        # model_path may be stored as relative ("models/laptop_recommender_…")
+        # or absolute.  Normalise to absolute.
+        raw_path = info.get("model_path", "")
+        if os.path.isabs(raw_path):
+            model_path = raw_path
+        else:
+            model_path = os.path.join(_PROJECT_ROOT, raw_path)
+
+        faiss_file = f"{model_path}_index.faiss"
+        if not os.path.exists(faiss_file):
+            print(f"[ModelManager] ❌ FAISS file not found: {faiss_file}")
+            return
+
+        version = info.get("version", "unknown")
+        print(f"[ModelManager] 📦 Loading model version: {version} …")
+
+        engine = LaptopRecommendationEngine()
+        engine.load(model_path)
+
+        cls._engine  = engine
+        cls._version = version
+        n = engine.index.index.ntotal if engine.index else 0
+        print(f"[ModelManager] ✅ Model ready — {n} laptops | version={version}")
+
 
 # =============================================================================
-# API ENDPOINTS
+# HELPERS
 # =============================================================================
 
-@method_decorator(csrf_exempt, name='dispatch')
+def _ok(data: dict, status: int = 200) -> JsonResponse:
+    return JsonResponse({"success": True, **data}, status=status)
+
+
+def _err(msg: str, detail: str = "", status: int = 400) -> JsonResponse:
+    body = {"success": False, "error": msg}
+    if detail:
+        body["detail"] = detail
+    return JsonResponse(body, status=status)
+
+
+def _no_model() -> JsonResponse:
+    return _err(
+        "Model not loaded",
+        "Run `python main.py` to train, then restart Django.",
+        status=503,
+    )
+
+
+# =============================================================================
+# VIEWS
+# =============================================================================
+
+@method_decorator(csrf_exempt, name="dispatch")
 class RecommendView(View):
     """
     POST /api/recommend/
-    
-    Request:
+
+    Single unified endpoint — selects recommendation strategy via `type`.
+
+    Request body (JSON)
+    -------------------
     {
-        "type": "text_search" | "similar" | "preferences",
-        "query": "gaming laptop with RTX",           # for text_search
-        "laptop_id": 5,                               # for similar
-        "preferences": {                              # for preferences
+        "type": "text_search",          // required
+        "query": "gaming laptop RTX",   // for text_search
+        "laptop_id": 42,                // for similar
+        "preferences": {                // for preferences
             "usage_type": "gaming",
             "max_price": 80000,
+            "min_price": 30000,
+            "preferred_brand": "ASUS",
             "min_ram": 16
+        },
+        "filters": {                    // optional for any type
+            "min_price": 20000,
+            "max_price": 100000,
+            "usage": "gaming"
         },
         "n_recommendations": 5
     }
+
+    Supported types
+    ---------------
+    text_search   Free-text semantic query
+    similar       Item-to-item similarity by laptop_id
+    preferences   Structured preference filters
+    personalized  History-based (pass "history": [id1, id2, …])
     """
-    
+
     def post(self, request):
-        start_time = time.time()
-        
-        # Parse request
+        start = time.time()
+
         try:
-            data = json.loads(request.body)
+            data = json.loads(request.body or "{}")
         except json.JSONDecodeError:
-            return JsonResponse({"error": "Invalid JSON"}, status=400)
-        
-        # Get model
+            return _err("Invalid JSON body.")
+
         engine = ModelManager.get_engine()
         if engine is None:
-            return JsonResponse({
-                "error": "Model not loaded",
-                "message": "Run: python -m pipelines.deployment_pipeline"
-            }, status=503)
-        
-        # Process request
-        rec_type = data.get('type', 'text_search')
-        n = data.get('n_recommendations', 5)
-        
+            return _no_model()
+
+        rec_type = data.get("type", "text_search")
+        n        = max(1, min(int(data.get("n_recommendations", 5)), 50))
+
+        # Optional filters shared across types
+        filters   = data.get("filters", {})
+        min_p     = filters.get("min_price") or data.get("min_price")
+        max_p     = filters.get("max_price") or data.get("max_price")
+        usage     = filters.get("usage")     or data.get("usage_filter")
+        price_rng = (float(min_p or 0), float(max_p)) if max_p else None
+
         try:
-            if rec_type == 'text_search':
+            # ── text search ────────────────────────────────────────────
+            if rec_type == "text_search":
+                query = data.get("query", "").strip()
+                if not query:
+                    return _err("'query' is required for text_search.")
                 results = engine.search_by_text(
-                    query=data.get('query', ''),
-                    n=n
+                    query,
+                    n=n,
+                    price_range=price_rng,
+                    usage_filter=usage,
                 )
-                
-            elif rec_type == 'similar':
-                laptop_id = data.get('laptop_id')
+
+            # ── item-to-item ───────────────────────────────────────────
+            elif rec_type == "similar":
+                laptop_id = data.get("laptop_id")
                 if laptop_id is None:
-                    return JsonResponse({"error": "laptop_id required"}, status=400)
-                results = engine.get_similar_laptops(laptop_id=laptop_id, n=n)
-                
-            elif rec_type == 'preferences':
-                prefs = data.get('preferences', {})
-                results = engine.get_recommendations_by_preferences(
-                    usage_type=prefs.get('usage_type'),
-                    max_price=prefs.get('max_price'),
-                    min_ram=prefs.get('min_ram'),
-                    preferred_brand=prefs.get('preferred_brand'),
-                    n=n
+                    return _err("'laptop_id' is required for type=similar.")
+                results = engine.get_similar_laptops(
+                    int(laptop_id),
+                    n=n,
+                    price_range=price_rng,
                 )
+
+            # ── preference-based ───────────────────────────────────────
+            elif rec_type == "preferences":
+                prefs = data.get("preferences", {})
+                results = engine.get_recommendations_by_preferences(
+                    usage_type=prefs.get("usage_type") or usage,
+                    max_price=float(prefs["max_price"]) if prefs.get("max_price") else (float(max_p) if max_p else None),
+                    min_price=float(prefs["min_price"]) if prefs.get("min_price") else (float(min_p) if min_p else None),
+                    preferred_brand=prefs.get("preferred_brand"),
+                    min_ram=int(prefs["min_ram"]) if prefs.get("min_ram") else None,
+                    n=n,
+                )
+
+            # ── personalised ───────────────────────────────────────────
+            elif rec_type == "personalized":
+                history = data.get("history", [])
+                if not isinstance(history, list):
+                    return _err("'history' must be a list of laptop IDs.")
+                results = engine.get_personalized_recommendations(
+                    user_history=[int(i) for i in history],
+                    n=n,
+                )
+
             else:
-                return JsonResponse({"error": f"Unknown type: {rec_type}"}, status=400)
-            
-            response_time = (time.time() - start_time) * 1000
-            
-            return JsonResponse({
-                "success": True,
-                "type": rec_type,
-                "count": len(results),
-                "recommendations": results,
-                "model_version": ModelManager.get_version(),
-                "response_time_ms": round(response_time, 2)
-            })
-            
-        except Exception as e:
-            return JsonResponse({"error": str(e)}, status=500)
+                return _err(
+                    f"Unknown type '{rec_type}'.",
+                    "Valid types: text_search, similar, preferences, personalized",
+                )
 
+        except Exception as exc:
+            return _err("Recommendation failed.", detail=str(exc), status=500)
 
-@method_decorator(csrf_exempt, name='dispatch')
-class HealthView(View):
-    """
-    GET /api/health/
-    
-    Returns model status and version
-    """
-    
-    def get(self, request):
-        engine = ModelManager.get_engine()
-        
-        # Get active version
-        active_version = None
-        active_file = os.path.join(settings.BASE_DIR, 'api', 'ml_models', 'active_version.txt')
-        if os.path.exists(active_file):
-            with open(active_file) as f:
-                active_version = f.read().strip()
-        
-        health_data = {
-            "status": "healthy" if engine else "unhealthy",
-            "model_loaded": engine is not None,
-            "model_version": ModelManager.get_version() or active_version,
-            "total_laptops": len(engine.df) if engine else 0,
-            "timestamp": time.time()
-        }
-        
-        status_code = 200 if engine else 503
-        return JsonResponse(health_data, status=status_code)
+        elapsed_ms = round((time.time() - start) * 1000, 2)
 
-
-@method_decorator(csrf_exempt, name='dispatch')
-class LaptopDetailView(View):
-    """
-    GET /api/laptop/<laptop_id>/
-    
-    Get details of a specific laptop
-    """
-    
-    def get(self, request, laptop_id):
-        engine = ModelManager.get_engine()
-        if engine is None:
-            return JsonResponse({"error": "Model not loaded"}, status=503)
-        
-        laptop = engine.df[engine.df['laptop_id'] == int(laptop_id)]
-        if laptop.empty:
-            return JsonResponse({"error": "Laptop not found"}, status=404)
-        
-        row = laptop.iloc[0]
-        return JsonResponse({
-            "laptop_id": int(row['laptop_id']),
-            "name": row['name'],
-            "brand": row['brand'],
-            "price": float(row['price']),
-            "cpu": row['cpu'],
-            "gpu": row['gpu'],
-            "ram_capacity": int(row['ram_capacity']),
-            "ssd": int(row['ssd']),
-            "screen_size": row['screen_size'],
-            "user_rating": float(row['user_rating']),
-            "usage_type": row.get('usage_type', 'unknown')
+        return _ok({
+            "type":            rec_type,
+            "count":           len(results),
+            "recommendations": results,
+            "model_version":   ModelManager.get_version(),
+            "response_time_ms":elapsed_ms,
         })
 
 
-@method_decorator(csrf_exempt, name='dispatch')
+# ---------------------------------------------------------------------------
+
+@method_decorator(csrf_exempt, name="dispatch")
+class HealthView(View):
+    """GET /api/health/"""
+
+    def get(self, request):
+        engine = ModelManager.get_engine()
+        n      = engine.index.index.ntotal if (engine and engine.index) else 0
+
+        body = {
+            "status":         "healthy" if engine else "unhealthy",
+            "model_loaded":   engine is not None,
+            "model_version":  ModelManager.get_version(),
+            "total_laptops":  n,
+            "timestamp":      time.time(),
+        }
+        return JsonResponse(body, status=200 if engine else 503)
+
+
+# ---------------------------------------------------------------------------
+
+@method_decorator(csrf_exempt, name="dispatch")
+class LaptopDetailView(View):
+    """GET /api/laptop/<laptop_id>/"""
+
+    def get(self, request, laptop_id: int):
+        engine = ModelManager.get_engine()
+        if engine is None:
+            return _no_model()
+
+        mask = engine.df["laptop_id"] == int(laptop_id)
+        if not mask.any():
+            return _err(f"Laptop {laptop_id} not found.", status=404)
+
+        row = engine.df[mask].iloc[0]
+
+        return _ok({
+            "laptop": {
+                "laptop_id":    int(row["laptop_id"]),
+                "name":         str(row["name"]),
+                "brand":        str(row["brand"]),
+                "price":        float(row["price"]),
+                "cpu":          str(row["cpu"]),
+                "gpu":          str(row["gpu"]),
+                "ram_capacity": int(row["ram_capacity"]),
+                "ssd":          int(row["ssd"]),
+                "screen_size":  row["screen_size"],
+                "user_rating":  float(row["user_rating"]),
+                "usage_type":   str(row.get("usage_type", "unknown")),
+                "gpu_type":     str(row.get("gpu_type",   "unknown")),
+                "cpu_tier":     str(row.get("cpu_tier",   "unknown")),
+            }
+        })
+
+
+# ---------------------------------------------------------------------------
+
+@method_decorator(csrf_exempt, name="dispatch")
 class AdminReloadView(View):
     """
     POST /api/admin/reload/
-    
-    Force model reload (called by deployment pipeline)
+    Immediately reloads the model from disk.
+    Call this after running `python main.py` to retrain without
+    restarting the Django server.
     """
-    
+
     def post(self, request):
-        # Create reload trigger
-        trigger_file = os.path.join(settings.BASE_DIR, 'api', 'ml_models', '.reload_trigger')
-        with open(trigger_file, 'w') as f:
-            f.write(str(time.time()))
-        
-        return JsonResponse({
-            "success": True,
-            "message": "Model reload triggered"
-        })
+        try:
+            engine = ModelManager.force_reload()
+            if engine is None:
+                return _err("Reload failed — no trained model found.", status=503)
+
+            return _ok({
+                "message":       "Model reloaded successfully.",
+                "model_version": ModelManager.get_version(),
+                "total_laptops": engine.index.index.ntotal,
+            })
+        except Exception as exc:
+            return _err("Reload error.", detail=str(exc), status=500)
 
 
 # =============================================================================
-# URL HANDLERS
+# URL HANDLER ALIASES  (used in urls.py)
 # =============================================================================
 
-recommend = RecommendView.as_view()
-health = HealthView.as_view()
+recommend    = RecommendView.as_view()
+health       = HealthView.as_view()
 laptop_detail = LaptopDetailView.as_view()
 admin_reload = AdminReloadView.as_view()

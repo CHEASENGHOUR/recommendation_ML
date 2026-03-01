@@ -1,6 +1,7 @@
 {
-  "version": "20260223_230457_d676c136",
-  "model_path": "models/laptop_recommender_20260223_230457_d676c136",
+  "version": "20260301_172303_2e2a7e22",
+  "model_path": "models/laptop_recommender_20260301_172303_2e2a7e22",
   "n_laptops": 6693,
-  "trained_at": "2026-02-23T23:05:21.020889"
+  "trained_at": "2026-03-01T17:23:24.625194",
+  "status": "production"
 }
