@@ -2,14 +2,6 @@ import pandas as pd
 import numpy as np
 
 def load_laptop_data(file_path: str) -> pd.DataFrame:
-    """
-    Load, clean and enrich the laptop CSV.
-
-    Returns a DataFrame with at minimum:
-        laptop_id, name, brand, price, cpu, gpu,
-        ram_capacity, ssd, screen_size, user_rating,
-        gpu_type, cpu_tier, usage_type
-    """
     df = pd.read_csv(file_path)
 
     # ── Normalise column names ──────────────────────────────────────────────
@@ -53,11 +45,6 @@ def load_laptop_data(file_path: str) -> pd.DataFrame:
 
     print(f"[data_ingest] Loaded {len(df)} laptops | columns: {list(df.columns)}")
     return df
-
-
-# ---------------------------------------------------------------------------
-# Internal helpers
-# ---------------------------------------------------------------------------
 
 def _categorize_gpu(gpu: str) -> str:
     g = str(gpu).lower()

@@ -4,7 +4,6 @@ import numpy as np
 import pandas as pd
 from sklearn.metrics.pairwise import cosine_similarity
 
-
 # Words to ignore when extracting matching tokens
 _STOPWORDS = {
     "a", "an", "the", "with", "and", "for", "to", "of", "in",
@@ -27,9 +26,6 @@ class RecommendationExplainer:
         self.index   = index
         self.df      = df
 
-    # ------------------------------------------------------------------
-    # 1. Item-to-item explanation
-    # ------------------------------------------------------------------
 
     def explain_similarity(
         self,
@@ -48,10 +44,6 @@ class RecommendationExplainer:
             "feature_comparisons": comparisons[:5],
             "key_insight":        self._generate_insight(query_row, rec_row, comparisons),
         }
-
-    # ------------------------------------------------------------------
-    # 2. Text-query explanation
-    # ------------------------------------------------------------------
 
     def explain_text_query(
         self,
@@ -86,10 +78,6 @@ class RecommendationExplainer:
             "query_intent":        self._infer_intent(query),
             "why_recommended":     self._text_explanation(query, laptop_row),
         }
-
-    # ------------------------------------------------------------------
-    # 3. Preference match explanation
-    # ------------------------------------------------------------------
 
     def explain_preference_match(
         self,
@@ -137,10 +125,6 @@ class RecommendationExplainer:
             "overall_assessment":    self._assess_trade_offs(matches, mismatches),
         }
 
-    # ------------------------------------------------------------------
-    # 4. Global feature importance
-    # ------------------------------------------------------------------
-
     def get_global_feature_importance(self) -> Dict:
         """Correlate embedding dimensions with price as a relevance proxy."""
         sample_size = min(100, len(self.df))
@@ -164,10 +148,6 @@ class RecommendationExplainer:
             "explanation":   "Embedding dims most correlated with laptop price/quality.",
             "interpretation":"Model prioritises: brand reputation, GPU tier, CPU generation, RAM.",
         }
-
-    # ------------------------------------------------------------------
-    # Private helpers
-    # ------------------------------------------------------------------
 
     def _compare_features(self, q: pd.Series, r: pd.Series) -> List[Dict]:
         specs = [

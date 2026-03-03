@@ -3,16 +3,8 @@ from typing import Dict, List
 import numpy as np
 import pandas as pd
 
-
-# ---------------------------------------------------------------------------
-# Individual metric functions
-# ---------------------------------------------------------------------------
-
 def evaluate_diversity(recommendations: List[Dict]) -> float:
-    """
-    Brand diversity of the recommendation list.
-    Returns the fraction of unique brands (0 = all same brand, 1 = all different).
-    """
+
     if len(recommendations) <= 1:
         return 0.0
     brands = [r.get("brand", "") for r in recommendations]
@@ -23,10 +15,7 @@ def evaluate_price_coverage(
     recommendations: List[Dict],
     target_price:    float,
 ) -> float:
-    """
-    How broadly the recommendations spread across price points
-    relative to the target price.  Capped at 1.0.
-    """
+    
     if not recommendations or target_price <= 0:
         return 0.0
     prices        = [r.get("price", 0) for r in recommendations]
@@ -42,29 +31,11 @@ def evaluate_avg_similarity(recommendations: List[Dict]) -> float:
     scores = [r.get("similarity_score", 0.0) for r in recommendations]
     return float(np.mean(scores))
 
-
-# ---------------------------------------------------------------------------
-# End-to-end evaluation
-# ---------------------------------------------------------------------------
-
 def evaluate_recommendation_quality(
     engine,
     test_cases: List[Dict],
     n:          int = 5,
 ) -> Dict:
-    """
-    Run the engine on *test_cases* and aggregate quality metrics.
-
-    Parameters
-    ----------
-    engine     : LaptopRecommendationEngine (already fitted)
-    test_cases : list of dicts with keys ``laptop_id`` and ``price``
-    n          : number of recommendations to request per test case
-
-    Returns
-    -------
-    dict with mean_similarity, mean_diversity, mean_price_coverage
-    """
     avg_similarities: List[float] = []
     diversity_scores: List[float] = []
     price_coverages:  List[float] = []
@@ -73,7 +44,6 @@ def evaluate_recommendation_quality(
         laptop_id = case.get("laptop_id")
         price     = case.get("price", 50_000)
 
-        # FIX: was get_content_based_recommendations() — correct name is get_similar_laptops()
         recs = engine.get_similar_laptops(laptop_id, n=n)
 
         if not recs:

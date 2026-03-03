@@ -8,26 +8,12 @@ import mlflow.sklearn
 
 
 class RecommendationExperimentTracker:
-    """
-    Manage MLflow runs for the laptop recommendation system.
-
-    Usage
-    -----
-    tracker = RecommendationExperimentTracker("laptop_recommender")
-    run     = tracker.start_run(tags={"stage": "training"})
-    tracker.log_params({"encoder": "all-MiniLM-L6-v2"})
-    tracker.log_metrics({"precision@10": 0.87})
-    tracker.end_run()
-    """
+    """ Manage MLflow runs for the laptop recommendation system. """
 
     def __init__(self, experiment_name: str = "laptop_recommendations"):
         self.experiment_name = experiment_name
         mlflow.set_experiment(experiment_name)
         self.active_run: Optional[mlflow.ActiveRun] = None
-
-    # ------------------------------------------------------------------
-    # Run lifecycle
-    # ------------------------------------------------------------------
 
     def start_run(
         self,
@@ -49,10 +35,6 @@ class RecommendationExperimentTracker:
         if self.active_run:
             mlflow.end_run()
             self.active_run = None
-
-    # ------------------------------------------------------------------
-    # Logging helpers
-    # ------------------------------------------------------------------
 
     def log_params(self, params: Dict[str, Any]) -> None:
         for k, v in params.items():
@@ -112,18 +94,10 @@ class RecommendationExperimentTracker:
         self.log_metrics(metrics)
         mlflow.log_dict(results, "evaluation_details.json")
 
-    # ------------------------------------------------------------------
-    # Registry
-    # ------------------------------------------------------------------
-
     def register_model(self, model_name: str = "laptop_recommender") -> None:
         if self.active_run:
             model_uri = f"runs:/{self.active_run.info.run_id}/model"
             mlflow.register_model(model_uri, model_name)
-
-    # ------------------------------------------------------------------
-    # Query
-    # ------------------------------------------------------------------
 
     def get_best_run(
         self,

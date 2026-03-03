@@ -1,21 +1,7 @@
-"""
-api/models.py
--------------
-Django ORM models for tracking deployed versions and logging API requests.
-
-After editing run:
-    python manage.py makemigrations api
-    python manage.py migrate
-"""
-
 from django.db import models
 
 
 class ModelVersion(models.Model):
-    """
-    Records every model version that has been trained and deployed.
-    Populated automatically by the training pipeline or manually via admin.
-    """
 
     version      = models.CharField(max_length=100, unique=True)
     deployed_at  = models.DateTimeField(auto_now_add=True)
@@ -28,7 +14,7 @@ class ModelVersion(models.Model):
         ordering = ["-deployed_at"]
 
     def __str__(self):
-        flag = "✅" if self.is_active else "⬜"
+        flag = "yes" if self.is_active else "no"
         return f"{flag} {self.version} ({self.n_laptops} laptops)"
 
     @classmethod
@@ -42,10 +28,6 @@ class ModelVersion(models.Model):
 
 
 class RecommendationLog(models.Model):
-    """
-    Logs every API recommendation request for monitoring, analytics,
-    and debugging.  Written by views.py on each successful response.
-    """
 
     QUERY_TYPES = [
         ("text_search",   "Text Search"),
@@ -81,19 +63,6 @@ class RecommendationLog(models.Model):
         response_time_ms: float,
         model_version:    str = "",
     ) -> "RecommendationLog":
-        """
-        Convenience factory used by views.py to log each request.
-
-        Usage in views.py
-        -----------------
-        RecommendationLog.record(
-            query_type="text_search",
-            query_data={"query": "gaming laptop"},
-            results_count=len(results),
-            response_time_ms=elapsed_ms,
-            model_version=ModelManager.get_version() or "",
-        )
-        """
         return cls.objects.create(
             query_type=query_type,
             query_data=query_data,

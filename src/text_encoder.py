@@ -25,17 +25,25 @@ class LaptopTextEncoder:
             f"{int(row.get('ram_capacity', 8))}GB RAM",
             f"{int(row.get('ssd', 256))}GB SSD",
             f"{row.get('screen_size', 15)} inch screen",
-            f"priced at {int(row.get('price', 0))} rupees",
+            # f"priced at {int(row.get('price', 0))} rupees",
+            f"priced at {int(row.get('price_usd', 0))} US dollars",
             f"rated {row.get('user_rating', 0):.1f} stars",
         ]
 
         # Contextual hints that improve semantic matching
         if row.get("gpu_vram", 0) > 0:
             parts.append("gaming capable")
-        price = row.get("price", 50000)
-        if price > 100_000:
+        # price = row.get("price", 50000)
+        # if price > 100_000:
+        #     parts.append("premium professional laptop")
+        # elif price < 40_000:
+        #     parts.append("budget friendly affordable")
+        
+        price = row.get("price_usd", 500)
+
+        if price > 1500:
             parts.append("premium professional laptop")
-        elif price < 40_000:
+        elif price < 500:
             parts.append("budget friendly affordable")
 
         usage = row.get("usage_type", "")

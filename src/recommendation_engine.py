@@ -9,31 +9,13 @@ from src.knn_index import LaptopKNNIndex
 
 
 class LaptopRecommendationEngine:
-    """
-    High-level engine used both during training and in the Django API.
-
-    Training workflow
-    -----------------
-    engine = LaptopRecommendationEngine()
-    engine.fit(df)
-    engine.save("models/laptop_recommender_v1")
-
-    Serving workflow
-    ----------------
-    engine = LaptopRecommendationEngine()
-    engine.load("models/laptop_recommender_v1")
-    results = engine.search_by_text("gaming laptop with RTX")
-    """
+    """ High-level engine used both during training and in the Django API. """
 
     def __init__(self):
         self.encoder:      Optional[LaptopTextEncoder] = None
         self.index:        Optional[LaptopKNNIndex]    = None
         self.df:           Optional[pd.DataFrame]      = None
         self._encoder_model: str = "all-MiniLM-L6-v2"
-
-    # ------------------------------------------------------------------
-    # Training
-    # ------------------------------------------------------------------
 
     def fit(
         self,
@@ -70,10 +52,6 @@ class LaptopRecommendationEngine:
         self.index.build_index(embeddings, df["laptop_id"].tolist(), metadata)
 
         return self
-
-    # ------------------------------------------------------------------
-    # Recommendation methods
-    # ------------------------------------------------------------------
 
     def get_similar_laptops(
         self,
@@ -158,7 +136,6 @@ class LaptopRecommendationEngine:
         if not embs:
             return self._popular(n)
 
-        # Exponential recency weighting
         weights = np.exp(np.linspace(-1, 0, len(embs)))
         weights /= weights.sum()
         q_emb = np.average(embs, axis=0, weights=weights).astype("float32")
@@ -166,19 +143,9 @@ class LaptopRecommendationEngine:
         results  = self.index.search(q_emb, k=n * 2)
         filtered = [r for r in results if r["laptop_id"] not in user_history]
         return self._format(filtered[:n])
-
-    # ------------------------------------------------------------------
-    # Persistence
-    # ------------------------------------------------------------------
-
+    
     def save(self, path_prefix: str) -> None:
-        """
-        Persist model to disk.
-        Writes:
-          {path_prefix}_index.faiss
-          {path_prefix}_index.meta
-          {path_prefix}_config.pkl
-        """
+
         self.index.save(f"{path_prefix}_index")
         config = {
             "encoder_model": self._encoder_model,
@@ -189,14 +156,6 @@ class LaptopRecommendationEngine:
         print(f"[engine] Model saved → {path_prefix}_*")
 
     def load(self, path_prefix: str) -> "LaptopRecommendationEngine":
-        """
-        Load a previously saved model from disk.
-        Restores encoder, KNN index, and DataFrame.
-
-        FIX: embedding_dim is now correctly read from the saved .meta file
-        (via the knn_index.load() fix) instead of defaulting to 384.
-        """
-        # Load KNN index (embedding_dim restored inside load())
         self.index = LaptopKNNIndex()
         self.index.load(f"{path_prefix}_index")
 
@@ -210,10 +169,6 @@ class LaptopRecommendationEngine:
 
         print(f"[engine] Model loaded ← {path_prefix}_*")
         return self
-
-    # ------------------------------------------------------------------
-    # Helpers
-    # ------------------------------------------------------------------
 
     def _format(
         self,

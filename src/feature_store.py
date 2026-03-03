@@ -9,16 +9,7 @@ import pandas as pd
 
 
 class LaptopFeatureStore:
-    """
-    Lightweight feature store backed by local files.
-
-    Directory layout
-    ----------------
-    extracted_data/
-      raw/            ← raw parquet + json metadata
-      processed/      ← cleaned parquet + json metadata
-      embeddings/     ← .npy embedding arrays
-    """
+    """ Lightweight feature store backed by local files. """
 
     def __init__(self, store_path: str = "extracted_data"):
         self.store_path       = store_path
@@ -29,9 +20,6 @@ class LaptopFeatureStore:
         for path in (self.raw_path, self.processed_path, self.embeddings_path):
             os.makedirs(path, exist_ok=True)
 
-    # ------------------------------------------------------------------
-    # Versioning
-    # ------------------------------------------------------------------
 
     def _compute_hash(self, df: pd.DataFrame) -> str:
         content = pd.util.hash_pandas_object(df).sum()
@@ -41,10 +29,6 @@ class LaptopFeatureStore:
         ts   = datetime.now().strftime("%Y%m%d_%H%M%S")
         h    = self._compute_hash(df)
         return f"{ts}_{h}"
-
-    # ------------------------------------------------------------------
-    # Raw data
-    # ------------------------------------------------------------------
 
     def save_raw_data(
         self,
@@ -71,10 +55,6 @@ class LaptopFeatureStore:
 
         print(f"[feature_store] Raw data saved → {filepath}")
         return version, metadata
-
-    # ------------------------------------------------------------------
-    # Processed features + embeddings
-    # ------------------------------------------------------------------
 
     def save_processed_features(
         self,
@@ -119,10 +99,6 @@ class LaptopFeatureStore:
         df         = pd.read_parquet(df_path)
         embeddings = np.load(emb_path)
         return df, embeddings, version
-
-    # ------------------------------------------------------------------
-    # Helpers
-    # ------------------------------------------------------------------
 
     def get_latest_version(self, data_type: str = "processed") -> Optional[str]:
         """Return the most recent version string, or None."""

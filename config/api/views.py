@@ -1,31 +1,4 @@
-"""
-api/views.py
-------------
-Django API views for the Laptop Recommendation System.
-
-Project layout
---------------
-rec_system/
-  api/views.py          ← this file
-  config/settings.py    ← BASE_DIR = rec_system/
-  models/               ← trained model artifacts (production_version.json etc.)
-  src/                  ← ML source code
-
-Model loading
--------------
-Reads rec_system/models/production_version.json which is written
-automatically by pipelines/training_pipeline.py after training.
-No manual configuration needed — just run `python main.py` to train,
-then `python manage.py runserver` to serve.
-
-Endpoints
----------
-POST /api/recommend/            — text search, item-to-item, or preferences
-GET  /api/health/               — model status + version
-GET  /api/laptop/<id>/          — single laptop detail
-POST /api/admin/reload/         — hot-reload model after retraining
-"""
-
+import re
 import json
 import os
 import sys
@@ -39,10 +12,6 @@ from django.utils.decorators import method_decorator
 from django.views import View
 from django.views.decorators.csrf import csrf_exempt
 
-# ---------------------------------------------------------------------------
-# Make sure rec_system/ (project root) is on sys.path so `src.*` imports work.
-# BASE_DIR in settings.py is rec_system/ (where manage.py lives).
-# ---------------------------------------------------------------------------
 _PROJECT_ROOT = str(Path(settings.BASE_DIR).parent)
 if _PROJECT_ROOT not in sys.path:
     sys.path.insert(0, _PROJECT_ROOT)
@@ -50,27 +19,7 @@ if _PROJECT_ROOT not in sys.path:
 from src.recommendation_engine import LaptopRecommendationEngine   # noqa: E402
 
 
-# =============================================================================
-# MODEL MANAGER  — thread-safe singleton
-# =============================================================================
-
 class ModelManager:
-    """
-    Thread-safe singleton that loads the trained model once and keeps it
-    in memory.  Supports hot-reload via a trigger file.
-
-    Model location
-    --------------
-    The training pipeline writes:
-        rec_system/models/production_version.json
-            {
-                "version":    "20260301_161819_2e2a7e22",
-                "model_path": "models/laptop_recommender_20260301_161819_2e2a7e22",
-                ...
-            }
-
-    model_path is relative to PROJECT_ROOT (rec_system/).
-    """
 
     _engine:  LaptopRecommendationEngine | None = None
     _version: str | None = None
@@ -79,10 +28,6 @@ class ModelManager:
     # Paths — all relative to rec_system/ (settings.BASE_DIR)
     _PRODUCTION_JSON  = "models/production_version.json"
     _RELOAD_TRIGGER   = "models/.reload_trigger"
-
-    # ------------------------------------------------------------------
-    # Public API
-    # ------------------------------------------------------------------
 
     @classmethod
     def get_engine(cls) -> LaptopRecommendationEngine | None:
@@ -116,10 +61,6 @@ class ModelManager:
     def get_version(cls) -> str | None:
         return cls._version
 
-    # ------------------------------------------------------------------
-    # Internal loader
-    # ------------------------------------------------------------------
-
     @classmethod
     def _load(cls) -> None:
         """
@@ -150,11 +91,11 @@ class ModelManager:
 
         faiss_file = f"{model_path}_index.faiss"
         if not os.path.exists(faiss_file):
-            print(f"[ModelManager] ❌ FAISS file not found: {faiss_file}")
+            print(f"[ModelManager] FAISS file not found: {faiss_file}")
             return
 
         version = info.get("version", "unknown")
-        print(f"[ModelManager] 📦 Loading model version: {version} …")
+        print(f"[ModelManager] Loading model version: {version} …")
 
         engine = LaptopRecommendationEngine()
         engine.load(model_path)
@@ -162,12 +103,7 @@ class ModelManager:
         cls._engine  = engine
         cls._version = version
         n = engine.index.index.ntotal if engine.index else 0
-        print(f"[ModelManager] ✅ Model ready — {n} laptops | version={version}")
-
-
-# =============================================================================
-# HELPERS
-# =============================================================================
+        print(f"[ModelManager] Model ready — {n} laptops | version={version}")
 
 def _ok(data: dict, status: int = 200) -> JsonResponse:
     return JsonResponse({"success": True, **data}, status=status)
@@ -187,46 +123,38 @@ def _no_model() -> JsonResponse:
         status=503,
     )
 
+def extract_price_intent(query: str, df):
 
-# =============================================================================
-# VIEWS
-# =============================================================================
+    q = query.lower()
+
+    if "price_usd" not in df.columns:
+        return None
+
+    prices = df["price_usd"]
+
+    min_price = prices.min()
+    max_price = prices.max()
+    low_threshold  = prices.quantile(0.35)
+    high_threshold = prices.quantile(0.75)
+
+    # Cheap keywords
+    if any(w in q for w in ["cheap", "budget", "affordable", "low price"]):
+        return (min_price, low_threshold)
+
+    # Premium keywords
+    if any(w in q for w in ["expensive", "premium", "luxury", "high-end"]):
+        return (high_threshold, max_price)
+
+    # Under $X detection
+    match = re.search(r'under\s*\$?(\d+)', q)
+    if match:
+        value = float(match.group(1))
+        return (min_price, value)
+
+    return None
 
 @method_decorator(csrf_exempt, name="dispatch")
 class RecommendView(View):
-    """
-    POST /api/recommend/
-
-    Single unified endpoint — selects recommendation strategy via `type`.
-
-    Request body (JSON)
-    -------------------
-    {
-        "type": "text_search",          // required
-        "query": "gaming laptop RTX",   // for text_search
-        "laptop_id": 42,                // for similar
-        "preferences": {                // for preferences
-            "usage_type": "gaming",
-            "max_price": 80000,
-            "min_price": 30000,
-            "preferred_brand": "ASUS",
-            "min_ram": 16
-        },
-        "filters": {                    // optional for any type
-            "min_price": 20000,
-            "max_price": 100000,
-            "usage": "gaming"
-        },
-        "n_recommendations": 5
-    }
-
-    Supported types
-    ---------------
-    text_search   Free-text semantic query
-    similar       Item-to-item similarity by laptop_id
-    preferences   Structured preference filters
-    personalized  History-based (pass "history": [id1, id2, …])
-    """
 
     def post(self, request):
         start = time.time()
@@ -256,10 +184,11 @@ class RecommendView(View):
                 query = data.get("query", "").strip()
                 if not query:
                     return _err("'query' is required for text_search.")
+                price_range = extract_price_intent(query, engine.df)
                 results = engine.search_by_text(
                     query,
                     n=n,
-                    price_range=price_rng,
+                    price_range=price_range,
                     usage_filter=usage,
                 )
 
@@ -315,12 +244,8 @@ class RecommendView(View):
             "response_time_ms":elapsed_ms,
         })
 
-
-# ---------------------------------------------------------------------------
-
 @method_decorator(csrf_exempt, name="dispatch")
 class HealthView(View):
-    """GET /api/health/"""
 
     def get(self, request):
         engine = ModelManager.get_engine()
@@ -335,12 +260,8 @@ class HealthView(View):
         }
         return JsonResponse(body, status=200 if engine else 503)
 
-
-# ---------------------------------------------------------------------------
-
 @method_decorator(csrf_exempt, name="dispatch")
 class LaptopDetailView(View):
-    """GET /api/laptop/<laptop_id>/"""
 
     def get(self, request, laptop_id: int):
         engine = ModelManager.get_engine()
@@ -371,17 +292,8 @@ class LaptopDetailView(View):
             }
         })
 
-
-# ---------------------------------------------------------------------------
-
 @method_decorator(csrf_exempt, name="dispatch")
 class AdminReloadView(View):
-    """
-    POST /api/admin/reload/
-    Immediately reloads the model from disk.
-    Call this after running `python main.py` to retrain without
-    restarting the Django server.
-    """
 
     def post(self, request):
         try:
@@ -396,11 +308,6 @@ class AdminReloadView(View):
             })
         except Exception as exc:
             return _err("Reload error.", detail=str(exc), status=500)
-
-
-# =============================================================================
-# URL HANDLER ALIASES  (used in urls.py)
-# =============================================================================
 
 recommend    = RecommendView.as_view()
 health       = HealthView.as_view()
